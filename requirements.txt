@@ -1,0 +1,4 @@
+﻿pandas==3.0.6
+pyarrow==26.0.0
+SQLAlchemy==2.1.5
+psycopg[binary]==3.3.6
