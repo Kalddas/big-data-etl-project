@@ -1,9 +1,11 @@
-﻿.venv/
+﻿
+.venv/
 __pycache__/
 *.py[cod]
 .env
 .env.*
 !.env.example
 *.log
+data/*.parquet
 data/raw/*.parquet
 data/processed/*.parquet

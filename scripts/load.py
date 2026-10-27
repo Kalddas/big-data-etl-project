@@ -1,8 +1,12 @@
-﻿from getpass import getpass
+﻿
+import argparse
+from getpass import getpass
 from pathlib import Path
+import logging
+import sys
 
 import pandas as pd
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import URL, create_engine, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -14,17 +18,69 @@ DATA_FILE = (
 )
 
 TABLE_NAME = "yellow_taxi_trips"
+SCHEMA_NAME = "public"
+CHUNK_SIZE = 10_000
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
-def main():
-    if not DATA_FILE.exists():
-        raise FileNotFoundError(f"Cleaned dataset not found: {DATA_FILE}")
+def read_dataset() -> pd.DataFrame:
+    """Read and validate the existing cleaned dataset."""
+    if not DATA_FILE.is_file():
+        raise FileNotFoundError(
+            f"Cleaned dataset was not found: {DATA_FILE}"
+        )
 
-    print("Reading cleaned dataset...")
-    df = pd.read_parquet(DATA_FILE)
-    expected_count = len(df)
-    print(f"Records in cleaned dataset: {expected_count:,}")
+    logger.info("Reading cleaned dataset: %s", DATA_FILE.name)
 
+    try:
+        df = pd.read_parquet(DATA_FILE)
+    except (OSError, ValueError, ImportError) as exc:
+        raise RuntimeError(
+            f"Could not read the cleaned Parquet file: {exc}"
+        ) from exc
+
+    if df.empty:
+        raise ValueError("The cleaned dataset contains no records.")
+
+    required_columns = {
+        "tpep_pickup_datetime",
+        "tpep_dropoff_datetime",
+        "trip_distance",
+        "trip_duration_minutes",
+        "pickup_hour",
+    }
+    missing_columns = required_columns - set(df.columns)
+
+    if missing_columns:
+        raise ValueError(
+            "Cleaned dataset is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    if df.columns.duplicated().any():
+        raise ValueError("The dataset contains duplicate column names.")
+
+    if df["trip_duration_minutes"].isna().any():
+        raise ValueError("Trip durations contain missing values.")
+
+    if (df["trip_duration_minutes"] < 0).any():
+        raise ValueError("Trip durations contain negative values.")
+
+    if not df["pickup_hour"].between(0, 23).all():
+        raise ValueError("Pickup-hour values must be between 0 and 23.")
+
+    logger.info("Dataset validation passed.")
+    logger.info("Records ready: %s", f"{len(df):,}")
+    return df
+
+
+def create_database_engine():
+    """Prompt for a password without storing it in source code."""
     password = getpass("Enter your PostgreSQL password: ")
 
     database_url = URL.create(
@@ -36,78 +92,124 @@ def main():
         database="taxi_etl_db",
     )
 
-    engine = create_engine(database_url)
+    return create_engine(database_url, pool_pre_ping=True)
+
+
+def validate_destination(engine, df: pd.DataFrame) -> int:
+    """Check the destination table and return its current row count."""
+    inspector = inspect(engine)
+
+    if not inspector.has_table(TABLE_NAME, schema=SCHEMA_NAME):
+        raise RuntimeError(
+            f"Destination table {SCHEMA_NAME}.{TABLE_NAME} "
+            "does not exist. No data was inserted."
+        )
+
+    destination_columns = {
+        column["name"]
+        for column in inspector.get_columns(
+            TABLE_NAME, schema=SCHEMA_NAME
+        )
+    }
+
+    missing_destination_columns = set(df.columns) - destination_columns
+    if missing_destination_columns:
+        raise ValueError(
+            "Destination table is missing dataset columns: "
+            + ", ".join(sorted(missing_destination_columns))
+        )
+
+    with engine.connect() as connection:
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public.yellow_taxi_trips")
+        ).scalar_one()
+
+    return int(count)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate and safely load taxi data into PostgreSQL."
+    )
+    parser.add_argument(
+        "--load",
+        action="store_true",
+        help="Explicitly attempt a database load. The table must be empty.",
+    )
+    args = parser.parse_args()
+
+    engine = None
 
     try:
-        print("\nConnecting to PostgreSQL...")
+        df = read_dataset()
+        engine = create_database_engine()
 
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
-        print("Database connection successful.")
 
-        with engine.connect() as connection:
-            table_exists = connection.execute(
-                text(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM information_schema.tables
-                        WHERE table_schema = 'public'
-                          AND table_name = :table_name
-                    )
-                    """
-                ),
-                {"table_name": TABLE_NAME},
-            ).scalar_one()
+        logger.info("Database connection successful.")
 
-            if not table_exists:
-                raise RuntimeError(
-                    "Destination table does not exist. "
-                    "Create and validate the table schema first."
-                )
+        current_count = validate_destination(engine, df)
+        logger.info("Current destination rows: %s", f"{current_count:,}")
 
-            current_count = connection.execute(
-                text("SELECT COUNT(*) FROM public.yellow_taxi_trips")
-            ).scalar_one()
+        if not args.load:
+            logger.info(
+                "VALIDATION ONLY: no records were inserted or modified."
+            )
+            logger.info(
+                "Dataset records: %s. Destination rows: %s.",
+                f"{len(df):,}",
+                f"{current_count:,}",
+            )
+            return 0
 
-        if current_count > 0:
+        if current_count != 0:
             raise RuntimeError(
-                f"Safety stop: destination table already contains "
-                f"{current_count:,} rows. No data was inserted."
+                "Safety stop: the destination table is not empty. "
+                "No data was inserted or deleted."
             )
 
-        print(f"\nLoading data into {TABLE_NAME}...")
+        logger.info("Starting database load in batches of %s.", CHUNK_SIZE)
 
-        df.to_sql(
-            name=TABLE_NAME,
-            con=engine,
-            schema="public",
-            if_exists="append",
-            index=False,
-            chunksize=10000,
-            method=None,
-        )
+        # Keep the load in a single transaction so a failed load can roll back.
+        with engine.begin() as connection:
+            df.to_sql(
+                name=TABLE_NAME,
+                con=connection,
+                schema=SCHEMA_NAME,
+                if_exists="append",
+                index=False,
+                chunksize=CHUNK_SIZE,
+                method=None,
+            )
 
-        with engine.connect() as connection:
             actual_count = connection.execute(
                 text("SELECT COUNT(*) FROM public.yellow_taxi_trips")
             ).scalar_one()
 
-        print("\nLOAD COMPLETED!")
-        print(f"Rows in PostgreSQL: {actual_count:,}")
-        print(f"Rows in cleaned dataset: {expected_count:,}")
-        print(f"Row counts match: {actual_count == expected_count}")
+            if actual_count != len(df):
+                raise RuntimeError(
+                    "Row-count validation failed inside the load transaction."
+                )
 
-        if actual_count != expected_count:
-            raise RuntimeError("Validation failed: row counts do not match.")
+        logger.info("Load completed. PostgreSQL rows: %s", f"{actual_count:,}")
+        return 0
 
-    except SQLAlchemyError as error:
-        print(f"\nDatabase error: {error}")
-        raise
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        RuntimeError,
+        SQLAlchemyError,
+        ImportError,
+    ) as exc:
+        logger.error("%s", exc)
+        return 1
 
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
