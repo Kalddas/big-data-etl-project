@@ -11,9 +11,9 @@
 | 1 | Dagmawit Adeferes | DBU 150 1104 |
 | 2 | Bruktawit Zelalem | DBU 150 1096 |
 | 3 | Bethelehem Beshahe | DBU 150 1061 |
-| 4 | Kindie Abera | DBU 150 (incomplete) |
-| 5 | Aman Baye | DBU 150 (incomplete) |
-| 6 | Amanuel nebey | DBU 150 (incomplete) |
+| 4 | Kindie Abera | DBU 150 1310  |
+| 5 | Aman Baye | DBU 150 0975 |
+| 6 | Amanuel nebey | DBU 150 0983 |
 
 **Before submission:** Confirm the spelling of team members' names and complete the missing student ID digits.
 
