@@ -15,7 +15,6 @@
 | 5 | Aman Baye | DBU 150 0975 |
 | 6 | Amanuel nebey | DBU 150 0983 |
 
-**Before submission:** Confirm the spelling of team members' names and complete the missing student ID digits.
 
 ## 1. Project Overview
 
